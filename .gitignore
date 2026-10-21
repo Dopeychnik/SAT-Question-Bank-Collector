@@ -1,0 +1,19 @@
+
+# Exported question data
+SAT_SQB_*.json
+*QuestionBank*.json
+exports/
+downloads/
+data/
+
+# Local files
+node_modules/
+.env
+.env.*
+*.log
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
