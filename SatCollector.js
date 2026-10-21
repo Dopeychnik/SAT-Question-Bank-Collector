@@ -1,543 +1,253 @@
 
-/*
- SAT Question Bank Collector
- Запуск: DevTools -> Console на сайте College Board
+/* SAT Question Bank Collector v1.0 — unofficial educational utility.
+   Run on the SAT Educator Question Bank website after reviewing the source.
+   Does not bypass authentication, access controls, or rate limits.
 */
-
 (async () => {
-  const existing = document.getElementById("sat-qbank-collector");
-  if (existing) existing.remove();
-
-  const API =
-    "https://qbank-api.collegeboard.org/msreportingquestionbank-prod/questionbank/digital/";
-
+  const PANEL_ID = 'sqbc-v1-panel';
+  document.getElementById(PANEL_ID)?.remove();
+  const API = 'https://qbank-api.collegeboard.org/msreportingquestionbank-prod/questionbank/digital/';
+  const DOMAINS = [
+    ['INI', 'Information and Ideas'],
+    ['CAS', 'Craft and Structure'],
+    ['SEC', 'Standard English Conventions'],
+    ['EOI', 'Expression of Ideas']
+  ];
+  const DB_NAME = 'sat-qbank-collector-v1';
   const catalog = new Map();
   const downloaded = new Map();
-  const failures = new Map();
+  let db, busy = false, stopped = false;
 
-  let stop = false;
-  let busy = false;
-
-  const sleep = ms =>
-    new Promise(resolve => setTimeout(resolve, ms));
-
-  function el(tag, props = {}, parent) {
-    const node = document.createElement(tag);
-    Object.assign(node, props);
-    if (parent) parent.appendChild(node);
-    return node;
+  function openDatabase() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const database = req.result;
+        if (!database.objectStoreNames.contains('catalog')) database.createObjectStore('catalog', { keyPath: 'external_id' });
+        if (!database.objectStoreNames.contains('questions')) database.createObjectStore('questions', { keyPath: 'external_id' });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
   }
-
-  async function request(path, body) {
-    const response = await fetch(API + path, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+  function dbPut(store, item) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(store, 'readwrite');
+      tx.objectStore(store).put(item);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+  function dbAll(store) {
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(store, 'readonly').objectStore(store).getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  async function post(endpoint, body) {
+    const response = await fetch(API + endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${path}`);
-    }
-
+    if (!response.ok) throw new Error(`${endpoint}: HTTP ${response.status}`);
     return response.json();
   }
-
   function unwrap(data) {
     if (Array.isArray(data)) return data;
-
-    if (data && typeof data === "object") {
-      return Object.values(data).flatMap(value =>
-        Array.isArray(value) ? value : []
-      );
-    }
-
-    return [];
+    if (!data || typeof data !== 'object') return [];
+    return Object.values(data).flatMap(v => Array.isArray(v) ? v : []);
   }
-
-  function save(filename, data) {
-    const blob = new Blob(
-      [JSON.stringify(data, null, 2)],
-      { type: "application/json" }
-    );
-
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-
-    link.href = url;
-    link.download = filename;
-
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  function make(tag, parent, props = {}) {
+    const element = document.createElement(tag);
+    Object.assign(element, props);
+    if (parent) parent.appendChild(element);
+    return element;
   }
-
-  // ---------- UI ----------
-
-  const panel = el(
-    "div",
-    { id: "sat-qbank-collector" },
-    document.body
-  );
-
-  panel.style.cssText = `
-    position: fixed;
-    top: 16px;
-    right: 16px;
-    z-index: 2147483647;
-    width: 370px;
-    max-height: 85vh;
-    overflow: auto;
-    background: #101827;
-    color: #e9eef8;
-    border: 1px solid #64748b;
-    border-radius: 12px;
-    padding: 16px;
-    box-shadow: 0 8px 30px #0008;
-    font: 13px system-ui, sans-serif;
-  `;
-
-  const title = el(
-    "div",
-    { textContent: "SAT Question Bank Collector" },
-    panel
-  );
-
-  title.style.cssText = `
-    font-size: 18px;
-    font-weight: 700;
-    margin-bottom: 10px;
-  `;
-
-  const subtitle = el(
-    "div",
-    {
-      textContent:
-        "Scan catalog → Select skills → Download → Export"
-    },
-    panel
-  );
-
-  subtitle.style.marginBottom = "14px";
-
-  function line(text) {
-    const node = el(
-      "div",
-      { textContent: text },
-      panel
-    );
-
-    node.style.margin = "10px 0";
-    return node;
-  }
-
-  // ---------- Domains ----------
-
-  line("Domains");
-
-  const domainBox = el("div", {}, panel);
-
-  const domains = [
-    ["INI", "Information and Ideas"],
-    ["CAS", "Craft and Structure"],
-    ["SEC", "Standard English Conventions"],
-    ["EOI", "Expression of Ideas"]
-  ];
-
-  const domainChecks = domains.map(([value, label]) => {
-    const wrapper = el("label", {}, domainBox);
-
-    wrapper.style.cssText = `
-      display: block;
-      margin: 5px 0;
-    `;
-
-    const checkbox = el(
-      "input",
-      {
-        type: "checkbox",
-        checked: true,
-        value
-      },
-      wrapper
-    );
-
-    wrapper.append(" " + label);
-
-    return checkbox;
+  const panel = make('section', document.body, { id: PANEL_ID });
+  panel.style.cssText = `position:fixed;top:18px;right:18px;width:390px;max-width:calc(100vw - 36px);max-height:calc(100vh - 36px);overflow:auto;z-index:2147483647;background:#101827;color:#e2e8f0;border:1px solid #334155;border-radius:16px;box-shadow:0 20px 65px #0009;font:13px/1.5 system-ui,sans-serif;padding:18px;box-sizing:border-box`;
+  const style = make('style', panel);
+  style.textContent = `#${PANEL_ID} *{box-sizing:border-box}#${PANEL_ID} h2{font-size:17px;margin:0}#${PANEL_ID} h3{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;margin:15px 0 8px}#${PANEL_ID} label{display:flex;align-items:center;gap:7px;padding:3px 0;cursor:pointer}#${PANEL_ID} input{accent-color:#60a5fa}#${PANEL_ID} button{background:#2563eb;color:white;border:0;border-radius:8px;padding:8px 10px;cursor:pointer;font:inherit}#${PANEL_ID} button.secondary{background:#334155}#${PANEL_ID} button:disabled{opacity:.5;cursor:default}#${PANEL_ID} .buttons{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}#${PANEL_ID} .muted{color:#94a3b8}#${PANEL_ID} .skills{max-height:190px;overflow:auto;background:#0b1220;border:1px solid #334155;padding:9px;border-radius:9px}#${PANEL_ID} .meter{height:8px;background:#334155;border-radius:10px;overflow:hidden;margin:10px 0}#${PANEL_ID} .fill{height:100%;background:#60a5fa;width:0%;transition:width .2s}#${PANEL_ID} .status{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1220;border-radius:9px;padding:10px;color:#bfdbfe;min-height:44px}`;
+  const header = make('div', panel);
+  header.style.cssText = 'display:flex;align-items:start;justify-content:space-between;gap:10px';
+  const heading = make('div', header);
+  make('h2', heading, { textContent: 'SAT Question Bank Collector' });
+  make('div', heading, { textContent: 'v1.0 · Local-first browser utility', className: 'muted' });
+  const close = make('button', header, { textContent: '×', className: 'secondary', title: 'Close panel' });
+  close.onclick = () => panel.remove();
+  make('h3', panel, { textContent: 'Domains' });
+  const domainArea = make('div', panel);
+  const domainBoxes = DOMAINS.map(([value, label]) => {
+    const row = make('label', domainArea);
+    const box = make('input', row, { type: 'checkbox', value, checked: value === 'INI' || value === 'CAS' });
+    make('span', row, { textContent: label });
+    return box;
   });
-
-  // ---------- Skills ----------
-
-  const skillLabel = line("Skills: scan catalog first");
-
-  const skillBox = el("div", {}, panel);
-
-  skillBox.style.cssText = `
-    max-height: 180px;
-    overflow: auto;
-    border: 1px solid #334155;
-    border-radius: 6px;
-    padding: 8px;
-  `;
-
-  // ---------- Difficulty ----------
-
-  line("Difficulty");
-
-  const difficultyBox = el("div", {}, panel);
-
-  const difficultyChecks = [
-    ["H", "Hard"],
-    ["M", "Medium"],
-    ["E", "Easy"]
-  ].map(([value, label]) => {
-    const wrapper = el("label", {}, difficultyBox);
-
-    wrapper.style.marginRight = "12px";
-
-    const checkbox = el(
-      "input",
-      {
-        type: "checkbox",
-        value,
-        checked: value === "H"
-      },
-      wrapper
-    );
-
-    wrapper.append(" " + label);
-
-    return checkbox;
+  const scanButtons = make('div', panel, { className: 'buttons' });
+  const scanButton = make('button', scanButtons, { textContent: 'Scan catalog' });
+  make('h3', panel, { textContent: 'Skills' });
+  const skillsActions = make('div', panel, { className: 'buttons' });
+  const allSkills = make('button', skillsActions, { textContent: 'Select all', className: 'secondary' });
+  const noSkills = make('button', skillsActions, { textContent: 'Clear', className: 'secondary' });
+  const skillArea = make('div', panel, { className: 'skills' });
+  make('div', skillArea, { textContent: 'Scan the catalog to load skills.', className: 'muted' });
+  allSkills.onclick = () => skillArea.querySelectorAll('input').forEach(x => x.checked = true);
+  noSkills.onclick = () => skillArea.querySelectorAll('input').forEach(x => x.checked = false);
+  make('h3', panel, { textContent: 'Difficulty' });
+  const difficultyArea = make('div', panel);
+  const difficulties = [['H','Hard'],['M','Medium'],['E','Easy']].map(([value,label]) => {
+    const row = make('label', difficultyArea);
+    row.style.display = 'inline-flex'; row.style.marginRight = '13px';
+    const input = make('input', row, { type: 'checkbox', value, checked: value === 'H' });
+    make('span', row, { textContent: label });
+    return input;
   });
+  const count = make('div', panel, { className: 'muted', textContent: '0 questions selected' });
+  const meter = make('div', panel, { className: 'meter' });
+  const fill = make('div', meter, { className: 'fill' });
+  const status = make('div', panel, { className: 'status', textContent: 'Loading local data…' });
+  const actions = make('div', panel, { className: 'buttons' });
+  const downloadButton = make('button', actions, { textContent: 'Download / Resume' });
+  const stopButton = make('button', actions, { textContent: 'Stop', className: 'secondary' });
+  const exportButton = make('button', actions, { textContent: 'Export selected JSON', className: 'secondary' });
+  const exportCatalogButton = make('button', actions, { textContent: 'Export catalog', className: 'secondary' });
+  const clearButton = make('button', actions, { textContent: 'Clear saved data', className: 'secondary' });
+  make('div', panel, { className: 'muted', textContent: 'Data stays in this browser until exported or cleared. Do not publish copyrighted question datasets.' });
 
-  // ---------- Status ----------
-
-  const status = line("Ready.");
-
-  status.style.cssText = `
-    white-space: pre-wrap;
-    color: #93c5fd;
-    margin-top: 14px;
-  `;
-
-  function log(message) {
-    status.textContent = message;
-    console.log("[SAT Collector]", message);
+  function log(text) { status.textContent = text; console.info('[SQBC]', text); }
+  function setProgress(done, total) { fill.style.width = total ? `${Math.round(done / total * 100)}%` : '0%'; }
+  function selection() {
+    const skills = new Set([...skillArea.querySelectorAll('input:checked')].map(x => x.value));
+    const levels = new Set(difficulties.filter(x => x.checked).map(x => x.value));
+    return [...catalog.values()].filter(q => skills.has(q.skill_desc || q.skill_cd || 'Unknown') && levels.has(q.difficulty));
   }
-
-  // ---------- Buttons ----------
-
-  const buttonBox = el("div", {}, panel);
-
-  buttonBox.style.cssText = `
-    display: flex;
-    flex-wrap: wrap;
-    gap: 7px;
-    margin: 14px 0;
-  `;
-
-  function button(label, handler) {
-    const node = el(
-      "button",
-      {
-        textContent: label,
-        type: "button"
-      },
-      buttonBox
-    );
-
-    node.style.cssText = `
-      background: #2563eb;
-      color: white;
-      border: 0;
-      border-radius: 6px;
-      padding: 8px 10px;
-      cursor: pointer;
-    `;
-
-    node.addEventListener("click", handler);
-
-    return node;
+  function updateCount() {
+    const selected = selection();
+    const done = selected.filter(q => downloaded.has(q.external_id)).length;
+    count.textContent = `${selected.length} selected · ${done} already downloaded · ${catalog.size} cataloged`;
+    return selected;
   }
-
-  // ---------- Catalog ----------
-
   function refreshSkills() {
-    skillBox.replaceChildren();
-
-    const groups = new Map();
-
-    for (const question of catalog.values()) {
-      const skill =
-        question.skill_desc ||
-        question.skill_cd ||
-        "Unknown";
-
-      groups.set(
-        skill,
-        (groups.get(skill) || 0) + 1
-      );
+    const previous = new Map([...skillArea.querySelectorAll('input')].map(x => [x.value, x.checked]));
+    const counts = new Map();
+    for (const q of catalog.values()) {
+      const skill = q.skill_desc || q.skill_cd || 'Unknown';
+      counts.set(skill, (counts.get(skill) || 0) + 1);
     }
-
-    const sorted = [...groups.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]));
-
-    for (const [skill, count] of sorted) {
-      const wrapper = el("label", {}, skillBox);
-
-      wrapper.style.cssText = `
-        display: block;
-        margin: 5px 0;
-      `;
-
-      const checkbox = el(
-        "input",
-        {
-          type: "checkbox",
-          checked: true,
-          value: skill
-        },
-        wrapper
-      );
-
-      wrapper.append(` ${skill} (${count})`);
+    skillArea.replaceChildren();
+    for (const [skill, number] of [...counts].sort((a,b) => a[0].localeCompare(b[0]))) {
+      const row = make('label', skillArea);
+      const box = make('input', row, { type: 'checkbox', value: skill, checked: previous.get(skill) ?? true });
+      make('span', row, { textContent: `${skill} (${number})` });
+      box.addEventListener('change', updateCount);
     }
-
-    skillLabel.textContent =
-      `Skills: ${groups.size} categories`;
+    updateCount();
   }
-
-  async function scanCatalog() {
+  async function scan() {
     if (busy) return;
-
-    const selectedDomains = domainChecks
-      .filter(checkbox => checkbox.checked)
-      .map(checkbox => checkbox.value);
-
-    if (!selectedDomains.length) {
-      log("Select at least one domain.");
-      return;
-    }
-
-    busy = true;
-    stop = false;
-
+    const selectedDomains = domainBoxes.filter(x => x.checked).map(x => x.value);
+    if (!selectedDomains.length) return log('Select at least one domain.');
+    busy = true; stopped = false; scanButton.disabled = true;
     try {
       for (const domain of selectedDomains) {
-        if (stop) break;
-
-        log(`Scanning ${domain}...`);
-
-        const response = await request(
-          "get-questions",
-          {
-            asmtEventId: 99,
-            test: 1,
-            domain
-          }
-        );
-
-        const questions = unwrap(response);
-
-        for (const question of questions) {
-          if (question.external_id) {
-            catalog.set(
-              question.external_id,
-              question
-            );
-          }
+        if (stopped) break;
+        log(`Scanning ${domain}…`);
+        const records = unwrap(await post('get-questions', { asmtEventId: 99, test: 1, domain }));
+        for (const q of records) {
+          if (!q.external_id) continue;
+          const entry = { ...q, _domain_code: domain };
+          catalog.set(q.external_id, entry);
+          await dbPut('catalog', entry);
         }
-
-        log(
-          `${domain}: ${questions.length} records\n` +
-          `Catalog: ${catalog.size} unique questions`
-        );
-
-        await sleep(500);
+        log(`${domain}: ${records.length} records. Total unique: ${catalog.size}`);
+        await sleep(400);
       }
-
       refreshSkills();
-
-      log(
-        `Catalog ready!\n` +
-        `${catalog.size} unique questions`
-      );
-    } catch (error) {
-      log(`Scan stopped: ${error.message}`);
-    } finally {
-      busy = false;
-    }
+      if (!stopped) log(`Catalog ready: ${catalog.size} unique questions.`);
+    } catch (err) { log(`Scan stopped: ${err.message}`); }
+    finally { busy = false; scanButton.disabled = false; }
   }
-
-  // ---------- Selection ----------
-
-  function getSelection() {
-    const selectedSkills = new Set(
-      [...skillBox.querySelectorAll("input:checked")]
-        .map(input => input.value)
-    );
-
-    const selectedDifficulties = new Set(
-      difficultyChecks
-        .filter(input => input.checked)
-        .map(input => input.value)
-    );
-
-    return [...catalog.values()].filter(question => {
-      const skill =
-        question.skill_desc ||
-        question.skill_cd ||
-        "Unknown";
-
-      return (
-        selectedSkills.has(skill) &&
-        selectedDifficulties.has(question.difficulty)
-      );
-    });
-  }
-
-  // ---------- Download ----------
-
-  async function downloadSelected() {
+  async function download() {
     if (busy) return;
-
-    if (!catalog.size) {
-      log("Scan the catalog first.");
-      return;
-    }
-
-    const selected = getSelection();
-
-    if (!selected.length) {
-      log("No questions match your filters.");
-      return;
-    }
-
-    busy = true;
-    stop = false;
-
-    let processed = 0;
-
+    const selected = updateCount();
+    if (!selected.length) return log('Select at least one skill and difficulty.');
+    const pending = selected.filter(q => !downloaded.has(q.external_id));
+    if (!pending.length) return log('All selected questions are already saved.');
+    busy = true; stopped = false; downloadButton.disabled = true;
+    let completed = selected.length - pending.length;
+    setProgress(completed, selected.length);
     try {
-      log(`Selected ${selected.length} questions.`);
-
-      for (const question of selected) {
-        if (stop) {
-          log("Stopped by user.");
-          break;
+      for (const q of pending) {
+        if (stopped) break;
+        // Stop on API errors; do not attempt to bypass service restrictions.
+        const detail = await post('get-question', { external_id: q.external_id });
+        const record = {
+          ...detail,
+          external_id: q.external_id,
+          questionId: q.questionId,
+          skill: q.skill_desc,
+          difficulty: q.difficulty,
+          domain: q.primary_class_desc
+        };
+        await dbPut('questions', record);
+        downloaded.set(q.external_id, record);
+        completed++;
+        setProgress(completed, selected.length);
+        if (completed % 5 === 0 || completed === selected.length) {
+          log(`${completed}/${selected.length} saved · ${selected.length - completed} remaining`);
+          updateCount();
         }
-
-        if (downloaded.has(question.external_id)) {
-          processed++;
-          continue;
-        }
-
-        try {
-          const detail = await request(
-            "get-question",
-            {
-              external_id: question.external_id
-            }
-          );
-
-          downloaded.set(question.external_id, {
-            questionId: question.questionId,
-            skill: question.skill_desc,
-            difficulty: question.difficulty,
-            domain: question.primary_class_desc,
-            ...detail
-          });
-
-          failures.delete(question.external_id);
-        } catch (error) {
-          failures.set(question.external_id, {
-            questionId: question.questionId,
-            error: String(error)
-          });
-
-          log(
-            `Stopped at ${question.questionId}\n` +
-            `${error.message}\n` +
-            `Downloaded: ${downloaded.size}`
-          );
-
-          break;
-        }
-
-        processed++;
-
-        if (
-          processed % 10 === 0 ||
-          processed === selected.length
-        ) {
-          log(
-            `${processed}/${selected.length} processed\n` +
-            `${downloaded.size} downloaded\n` +
-            `${failures.size} failures`
-          );
-        }
-
         await sleep(600);
       }
-
-      if (!stop && failures.size === 0) {
-        log(
-          `Download complete!\n` +
-          `${downloaded.size} questions saved`
-        );
-      }
-    } finally {
-      busy = false;
+      log(stopped ? `Paused. ${completed}/${selected.length} saved. Click Download / Resume to continue.` : `Complete: ${completed}/${selected.length} saved.`);
+    } catch (err) { log(`Paused due to error: ${err.message}\nAlready downloaded questions remain saved.`); }
+    finally { busy = false; downloadButton.disabled = false; updateCount(); }
+  }
+  function exportJSON(filename, object) {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(object, null, 2)], { type: 'application/json' }));
+    const anchor = make('a', document.body, { href: url, download: filename });
+    anchor.click(); anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+  scanButton.onclick = scan;
+  downloadButton.onclick = download;
+  stopButton.onclick = () => { stopped = true; log('Stopping after the current request…'); };
+  exportButton.onclick = () => {
+    const selected = selection();
+    const items = selected.map(q => downloaded.get(q.external_id)).filter(Boolean);
+    if (!items.length) return log('No downloaded questions match current filters.');
+    exportJSON('SAT_SQB_Selected.json', { source: 'College Board SAT Question Bank', exportedAt: new Date().toISOString(), count: items.length, questions: items });
+    log(`Exported ${items.length} selected questions.`);
+  };
+  exportCatalogButton.onclick = () => {
+    exportJSON('SAT_SQB_Catalog.json', { exportedAt: new Date().toISOString(), count: catalog.size, questions: [...catalog.values()] });
+    log(`Exported catalog of ${catalog.size} questions.`);
+  };
+  clearButton.onclick = async () => {
+    if (busy) return log('Stop the active operation first.');
+    if (!confirm('Delete all saved catalog and question data from this browser?')) return;
+    for (const store of ['catalog', 'questions']) {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readwrite');
+        tx.objectStore(store).clear();
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
     }
+    catalog.clear(); downloaded.clear(); refreshSkills(); setProgress(0, 0);
+    log('Saved data cleared.');
+  };
+  difficulties.forEach(x => x.addEventListener('change', updateCount));
+  try {
+    db = await openDatabase();
+    (await dbAll('catalog')).forEach(q => catalog.set(q.external_id, q));
+    (await dbAll('questions')).forEach(q => downloaded.set(q.external_id, q));
+    refreshSkills();
+    log(`Ready. Restored ${catalog.size} catalog entries and ${downloaded.size} downloaded questions.`);
+  } catch (err) {
+    log(`IndexedDB unavailable: ${err.message}. Check browser storage settings.`);
+    scanButton.disabled = true; downloadButton.disabled = true;
   }
-
-  // ---------- Export ----------
-
-  function exportQuestions() {
-    save("SAT_SQB_Collection.json", {
-      source: "College Board SAT Question Bank",
-      exportedAt: new Date().toISOString(),
-      catalogSize: catalog.size,
-      questions: [...downloaded.values()],
-      failed: [...failures.values()]
-    });
-
-    log(
-      `Exported ${downloaded.size} questions.`
-    );
-  }
-
-  function exportCatalog() {
-    save("SAT_SQB_Catalog.json", {
-      source: "College Board SAT Question Bank",
-      questions: [...catalog.values()]
-    });
-
-    log(
-      `Exported catalog: ${catalog.size} records.`
-    );
-  }
-
-  // ---------- Controls ----------
-
-  button("Scan catalog", scanCatalog);
-
-  button("Download selected", downloadSelected);
-
-  button("Stop", () => {
-    stop = true;
-    log("Stopping after current request...");
-  });
-
-  button("Export JSON", exportQuestions);
-
-  button("Export catalog", exportCatalog);
-
-  button("Close", () => panel.remove());
-
-  log("Ready. Click Scan catalog.");
 })();
